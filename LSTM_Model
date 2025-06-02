@@ -1,1 +1,474 @@
+import torch
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import ast
+import re
+from torch.utils.data import DataLoader, Dataset
+from sklearn.preprocessing import MultiLabelBinarizer
+from torch import nn, optim
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+import numpy as np
+from sklearn.metrics import accuracy_score, f1_score
+from collections import Counter
+from torch.nn.utils.rnn import pad_sequence
+import nltk
+nltk.download('stopwords')
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
+
+import ast
+
+def clean_genres(x):
+    if isinstance(x, list):
+        return [genre.strip() for genre in x if isinstance(genre, str)]
+    
+    if isinstance(x, str):
+        return [genre.strip() for genre in x.split(',') if genre.strip()]
+    
+    return []
+
+df["genres"] = df["genres"].apply(clean_genres)
+
+from IPython.display import display
+
+# Calculate the average number of genres per movie
+df['num_genres'] = df['genres'].apply(len)
+average_genres = df['num_genres'].mean()
+
+# visualize the movie genre distribution
+plt.figure(figsize=(10,6))
+sns.histplot(df['num_genres'], kde=False, bins=range(1, df['num_genres'].max() + 2), color='skyblue', edgecolor='black')
+plt.axvline(x=1, color='red', linestyle='--', label="Movies with <= 2 Genres")
+plt.axvline(x=2, color='green', linestyle='--', label="Movies with >2 Genres")
+plt.title('Genre Distribution per Movie', fontsize=14)
+plt.xlabel('Number of Genres', fontsize=12)
+plt.ylabel('Number of Movies', fontsize=12)
+plt.legend()
+plt.show()
+
+# Because this is a text-focused model, we review the common words across the title, synposis and genres
+from wordcloud import WordCloud
+
+stop_words1 = set(stopwords.words('english'))
+
+def common_words(df, columns, top_n=10):
+    common_words = {}
+    for col in columns:
+        text_data1 = df[col].dropna().tolist()
+        if isinstance(text_data1[0], list):
+            flat_text1 = [' '.join(item) for item in text_data1]
+        else:
+            flat_text1 = text_data1
+            full_text1 = ' '.join(flat_text1).lower()
+            full_text1 = re.sub(r"<.*?>", "", full_text1)  
+            full_text1 = re.sub(r"[^a-zA-Z\s]", "", full_text1) 
+ 
+            tokens1 = word_tokenize(full_text1)
+            tokens1 = [w for w in tokens1 if w not in stop_words1 and len(w) > 2]
+
+            word_counts1 = Counter(tokens1)
+            common_words[col] = word_counts1.most_common(top_n)
+    return common_words
+
+def wordcloud(common_words_dict):
+    for col, words in common_words_dict.items():
+        word_freq1 = dict(words)
+        wc1 = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(word_freq1)
+        
+        plt.figure(figsize=(6, 4))
+        plt.imshow(wc1, interpolation='bilinear')
+        plt.title(f"Word Cloud for {col.capitalize()}", fontsize=16)
+        plt.axis('off')
+        plt.show()
+
+# using MultiLabelBinarizer to encode the genres
+mlb = MultiLabelBinarizer()
+genres_encoded = mlb.fit_transform(df["genres"])
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+def build_vocab(texts, min_freq=2):
+    counter = Counter()
+    for text in texts:
+        tokens = word_tokenize(text.lower())
+        counter.update(tokens)
+    vocab = {'<PAD>': 0, '<UNK>': 1}
+    for word, freq in counter.items():
+        if freq >= min_freq:
+            vocab[word] = len(vocab)
+    return vocab
+
+
+class MovieGenreDataset(Dataset):
+    def __init__(self, overviews, genres, vocab, max_len=300):
+        self.overviews = overviews.reset_index(drop=True)
+        self.genres = genres.reset_index(drop=True)
+        self.vocab = vocab
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.overviews)
+
+    def __getitem__(self, idx):
+        overview = self.overviews[idx]
+        genre = torch.tensor(self.genres[idx], dtype=torch.float)
+
+        tokens = word_tokenize(overview.lower())
+        indices = [self.vocab.get(token, self.vocab['<UNK>']) for token in tokens]
+        indices = indices[:self.max_len] + [self.vocab['<PAD>']] * (self.max_len - len(indices))
+        indices = torch.tensor(indices, dtype=torch.long)
+
+        return indices, genre
+
+
+class LSTMGenreClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, output_dim, num_layers=1, dropout=0.5):
+        super(LSTMGenreClassifier, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0.0)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        embedded = self.embedding(x)
+        lstm_out, _ = self.lstm(embedded)
+        out = self.dropout(lstm_out[:, -1, :])
+        out = self.fc(out)
+        return out
+
+
+all_genres = sorted(set(g for genre_list in df['genres'] for g in genre_list))
+mlb = MultiLabelBinarizer(classes=all_genres)
+genre_encoded = mlb.fit_transform(df['genres'])
+
+X_train, X_test, y_train, y_test = train_test_split(df['overview'], genre_encoded, test_size=0.2, random_state=42)
+
+vocab = build_vocab(X_train)
+max_len = 300
+
+train_dataset = MovieGenreDataset(X_train, pd.Series(list(y_train)), vocab)
+test_dataset = MovieGenreDataset(X_test, pd.Series(list(y_test)), vocab)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32)
+
+
+model = LSTMGenreClassifier(
+    vocab_size=len(vocab),
+    embed_dim=128,
+    hidden_dim=256,
+    output_dim=len(all_genres),
+    num_layers=1,
+    dropout=0.0
+).to(device)
+
+# Compute weights to balance the underpresented genres
+genre_counts = np.sum(y_train, axis=0)
+pos_weights = torch.tensor((len(y_train) - genre_counts) / genre_counts, dtype=torch.float).to(device)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+
+def evaluate(model, dataloader, threshold=0.3):
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            preds = (torch.sigmoid(outputs) > threshold).float()
+            all_preds.append(preds.cpu())
+            all_labels.append(labels.cpu())
+    y_true = torch.cat(all_labels).numpy()
+    y_pred = torch.cat(all_preds).numpy()
+
+    f1_micro = f1_score(y_true, y_pred, average='micro', zero_division=0)
+    f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    multilabel_acc = (y_true == y_pred).mean()
+    return multilabel_acc, f1_micro, f1_macro, f1_weighted
+
+
+epochs = 10
+for epoch in range(epochs):
+    model.train()
+    total_loss = 0
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(train_loader)
+    acc, f1_micro, f1_macro, f1_weighted = evaluate(model, test_loader)
+
+
+# to download, extract and load the glove embeddings 
+
+import os
+import zipfile
+import urllib.request
+
+# Setup
+glove_url = "http://nlp.stanford.edu/data/glove.6B.zip"
+glove_zip_path = "glove.6B.zip"
+glove_folder = "glove.6B"
+glove_file = "glove.6B.100d.txt"
+glove_path = os.path.join(glove_folder, glove_file)
+
+# Download
+if not os.path.exists(glove_zip_path):
+    print("Downloading GloVe embeddings...")
+    urllib.request.urlretrieve(glove_url, glove_zip_path)
+    print("Download completed.")
+
+# And then Extract
+if not os.path.exists(glove_folder):
+    print("Extracting GloVe embeddings...")
+    with zipfile.ZipFile(glove_zip_path, "r") as zip_ref:
+        zip_ref.extractall(glove_folder)
+    print("Extraction completed.")
+
+
+if not os.path.exists(glove_path):
+    raise FileNotFoundError(f"Expected GloVe file not found at {glove_path}. Check extraction folder.")
+
+
+print("Loading GloVe embeddings into memory...")
+embedding_dim = 100
+embeddings_index = {}
+
+with open(glove_path, encoding="utf8") as f:
+    for line in f:
+        values = line.strip().split()
+        word = values[0]
+        coefs = list(map(float, values[1:]))
+        embeddings_index[word] = coefs
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print("Using device:", device)
+
+
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r"<.*?>", "", text)
+    text = re.sub(r"[^a-zA-Z\s]", "", text)
+    return text
+
+df["overview"] = df["overview"].apply(clean_text)
+
+
+tokenized = df["overview"].apply(word_tokenize)
+
+
+from collections import Counter
+counter = Counter()
+for tokens in tokenized:
+    counter.update(tokens)
+vocab = {word: i+2 for i, (word, _) in enumerate(counter.items())}
+vocab["<PAD>"] = 0
+vocab["<UNK>"] = 1
+
+# the GloVe embeddings
+glove_path = os.path.join("glove.6B", "glove.6B.100d.txt")
+embedding_dim = 100
+embeddings_index = {}
+with open(glove_path, encoding="utf8") as f:
+    for line in f:
+        values = line.split()
+        word = values[0]
+        coefs = np.asarray(values[1:], dtype='float32')
+        embeddings_index[word] = coefs
+
+embedding_matrix = np.zeros((len(vocab), embedding_dim))
+for word, i in vocab.items():
+    embedding_vector = embeddings_index.get(word)
+    if embedding_vector is not None:
+        embedding_matrix[i] = embedding_vector
+
+# Tokens encoding
+def encode_tokens(tokens, vocab, max_len=200):
+    encoded = [vocab.get(token, vocab["<UNK>"]) for token in tokens]
+    if len(encoded) < max_len:
+        encoded += [vocab["<PAD>"]] * (max_len - len(encoded))
+    else:
+        encoded = encoded[:max_len]
+    return encoded
+
+df["input_ids"] = tokenized.apply(lambda x: encode_tokens(x, vocab))
+
+# Labels encoding
+mlb = MultiLabelBinarizer()
+labels = mlb.fit_transform(df["genres"])
+
+
+from sklearn.model_selection import train_test_split
+X_train, X_test, y_train, y_test = train_test_split(df["input_ids"].tolist(), labels, test_size=0.2, random_state=42)
+
+
+class MovieDataset(Dataset):
+    def __init__(self, inputs, labels):
+        self.inputs = inputs
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.inputs[idx], dtype=torch.long), torch.tensor(self.labels[idx], dtype=torch.float32)
+
+train_dataset = MovieDataset(X_train, y_train)
+test_dataset = MovieDataset(X_test, y_test)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32)
+
+# Define the Model
+class GenreClassifier(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim, embedding_matrix, dropout=0.5):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.embedding.weight = nn.Parameter(torch.tensor(embedding_matrix, dtype=torch.float32))
+        self.embedding.weight.requires_grad = True  # Allow fine-tuning of GloVe embeddings
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers=2, bidirectional=True, batch_first=True, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim * 2, output_dim)
+
+    def forward(self, x):
+        embedded = self.embedding(x)
+        output, _ = self.lstm(embedded)
+        out = self.dropout(torch.mean(output, dim=1))
+        return self.fc(out)
+
+model = GenreClassifier(vocab_size=len(vocab), embedding_dim=embedding_dim, hidden_dim=256, output_dim=len(mlb.classes_), embedding_matrix=embedding_matrix, dropout=0.5).to(device)
+
+
+label_counts = labels.sum(axis=0)
+pos_weights = (len(labels) - label_counts) / (label_counts + 1e-5) 
+pos_weights = torch.tensor(pos_weights, dtype=torch.float32).to(device)
+
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+
+def train(model, loader):
+    model.train()
+    epoch_loss = 0
+    all_preds = []
+    all_labels = []
+    for inputs, labels in loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+        all_preds.extend(torch.sigmoid(outputs).detach().cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+    return epoch_loss / len(loader), all_preds, all_labels
+
+
+def evaluate(model, loader):
+    model.eval()
+    epoch_loss = 0
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            epoch_loss += loss.item()
+            all_preds.extend(torch.sigmoid(outputs).cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    return epoch_loss / len(loader), all_preds, all_labels
+
+def get_optimal_thresholds(y_true, y_probs):
+    thresholds = []
+    for i in range(y_true.shape[1]):
+        best_thresh = 0.5
+        best_f1 = 0
+        for thresh in np.linspace(0.1, 0.9, 81):  # test thresholds from 0.1 to 0.9
+            preds = (y_probs[:, i] >= thresh).astype(int)
+            f1 = f1_score(y_true[:, i], preds, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thresh = thresh
+        thresholds.append(best_thresh)
+    return np.array(thresholds)
+
+
+train_losses, val_losses = [], []
+accuracy = []
+f1_weighted_score = []
+
+train_losses, val_losses = [], []
+accuracy = []
+f1_weighted_score = []
+
+thresholds = None  
+
+for epoch in range(20):
+    train_loss, train_preds, train_true = train(model, train_loader)
+    val_loss, val_preds, val_true = evaluate(model, test_loader)
+
+    val_preds_np = np.array(val_preds)
+    val_true_np = np.array(val_true)
+
+    # thresholds calculated after the first epoch only 
+    if thresholds is None:
+        thresholds = get_optimal_thresholds(val_true_np, val_preds_np)
+
+    # then apply the optimal thresholds
+    val_bin = (val_preds_np >= thresholds).astype(int)
+
+    print(f"Epoch {epoch+1}/20 - Loss: {val_loss:.4f}")
+    print("Val preds range:", np.min(val_preds_np), np.max(val_preds_np))
+    print("Sample preds:", val_bin[0])
+    print("Sample labels:", val_true_np[0])
+
+    acc = accuracy_score(val_true_np, val_bin)
+    f1_micro = f1_score(val_true_np, val_bin, average='micro', zero_division=0)
+    f1_macro = f1_score(val_true_np, val_bin, average='macro', zero_division=0)
+    f1_weighted = f1_score(val_true_np, val_bin, average='weighted', zero_division=0)
+
+    print(f"Acc: {acc:.3f} | F1 Micro: {f1_micro:.3f} | F1 Macro: {f1_macro:.3f} | F1 Weighted: {f1_weighted:.3f}")
+    
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    accuracy.append(acc)
+    f1_weighted_score.append(f1_weighted)
+
+
+
+# ....classification report
+val_bin_final = (val_preds_np > thresholds).astype(int)
+print(classification_report(y_test, val_bin_final, target_names=mlb.classes_, zero_division=0))
+
+import matplotlib.pyplot as plt
+
+epochs = list(range(1, len(accuracy) + 1))
+
+plt.figure(figsize=(10, 6))
+plt.plot(epochs, accuracy, label='Accuracy', marker='o')
+plt.plot(epochs, f1_weighted_score, label='F1 Weighted', marker='s')
+
+plt.title('Improved LSTM Model Performance Over Epochs(Accuracy vs F1 score)')
+plt.xlabel('Epoch')
+plt.ylabel('Evaluation Metrics')
+plt.ylim(0, 1)
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
 
